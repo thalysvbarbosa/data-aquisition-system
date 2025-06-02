@@ -9,12 +9,14 @@
 
 using boost::asio::ip::tcp;
 
+#pragma pack(push, 1)
 struct LogRecord
 {
-    char sensor_id[32];
-    std::time_t timestamp;
-    double value;
+    char sensor_id[32];    // supondo um ID de sensor de até 32 caracteres
+    std::time_t timestamp; // timestamp UNIX
+    double value;          // valor da leitura
 };
+#pragma pack(pop)
 
 class Session : public std::enable_shared_from_this<Session>
 {
