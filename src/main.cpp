@@ -6,6 +6,7 @@
 #include <ctime>
 #include <iomanip>
 #include <sstream>
+#include <mutex> // Adicionado para std::mutex
 
 using boost::asio::ip::tcp;
 
@@ -21,8 +22,8 @@ struct LogRecord
 class Session : public std::enable_shared_from_this<Session>
 {
 public:
-    Session(tcp::socket socket, std::unordered_map<std::string, std::ofstream> &logs)
-        : socket_(std::move(socket)), logs_(logs) {}
+    Session(tcp::socket socket, std::unordered_map<std::string, std::ofstream> &logs, std::mutex &logs_mutex)
+        : socket_(std::move(socket)), logs_(logs), logs_mutex_(logs_mutex) {}
 
     void start()
     {
@@ -55,20 +56,44 @@ private:
             if (parts.size() == 4)
             {
                 const std::string &sensor_id = parts[1];
-                const std::string &timestamp = parts[2];
-                const std::string &value = parts[3];
+                const std::string &timestamp_str = parts[2]; // Renomeado para evitar conflito
+                const std::string &value_str = parts[3];     // Renomeado para evitar conflito
 
                 LogRecord record;
-                std::strncpy(record.sensor_id, sensor_id.c_str(), sizeof(record.sensor_id));
-                record.timestamp = string_to_time_t(timestamp);
-                record.value = std::stod(value);
-
-                if (logs_.find(sensor_id) == logs_.end())
+                std::strncpy(record.sensor_id, sensor_id.c_str(), sizeof(record.sensor_id) - 1);
+                record.sensor_id[sizeof(record.sensor_id) - 1] = '\\0'; // Garantir terminação nula
+                record.timestamp = string_to_time_t(timestamp_str);
+                try
                 {
-                    logs_[sensor_id].open(sensor_id + ".log", std::ios::binary | std::ios::app);
-                }
+                    record.value = std::stod(value_str);
 
-                logs_[sensor_id].write(reinterpret_cast<const char *>(&record), sizeof(record));
+                    std::lock_guard<std::mutex> lock(logs_mutex_);
+                    if (logs_.find(sensor_id) == logs_.end())
+                    {
+                        logs_[sensor_id].open(sensor_id + ".log", std::ios::binary | std::ios::app);
+                    }
+
+                    if (logs_[sensor_id].is_open())
+                    {
+                        logs_[sensor_id].write(reinterpret_cast<const char *>(&record), sizeof(record));
+                        logs_[sensor_id].flush(); // Garantir que os dados sejam escritos imediatamente
+                    }
+                    else
+                    {
+                        // Opcional: Logar erro se o arquivo não pôde ser aberto
+                        std::cerr << "Error: Could not open log file for sensor " << sensor_id << std::endl;
+                    }
+                }
+                catch (const std::invalid_argument &ia)
+                {
+                    std::cerr << "Invalid argument: " << ia.what() << " for sensor_id: " << sensor_id << " value: " << value_str << std::endl;
+                    // Opcional: Enviar erro de volta ao cliente
+                }
+                catch (const std::out_of_range &oor)
+                {
+                    std::cerr << "Out of Range error: " << oor.what() << " for sensor_id: " << sensor_id << " value: " << value_str << std::endl;
+                    // Opcional: Enviar erro de volta ao cliente
+                }
             }
         }
         else if (message.rfind("GET|", 0) == 0)
@@ -77,11 +102,43 @@ private:
             if (parts.size() == 3)
             {
                 const std::string &sensor_id = parts[1];
-                int num_records = std::stoi(parts[2]);
+                int num_records = 0;
+                try
+                {
+                    num_records = std::stoi(parts[2]);
+                }
+                catch (const std::invalid_argument &ia)
+                {
+                    std::cerr << "Invalid argument for num_records: " << ia.what() << " value: " << parts[2] << std::endl;
+                    std::string error = "ERROR|INVALID_NUM_RECORDS\\r\\n";
+                    boost::asio::write(socket_, boost::asio::buffer(error));
+                    return;
+                }
+                catch (const std::out_of_range &oor)
+                {
+                    std::cerr << "Out of Range error for num_records: " << oor.what() << " value: " << parts[2] << std::endl;
+                    std::string error = "ERROR|INVALID_NUM_RECORDS\\r\\n";
+                    boost::asio::write(socket_, boost::asio::buffer(error));
+                    return;
+                }
 
-                if (logs_.find(sensor_id) != logs_.end())
+                bool sensor_exists;
+                {
+                    std::lock_guard<std::mutex> lock(logs_mutex_);
+                    sensor_exists = (logs_.count(sensor_id) > 0);
+                }
+
+                if (sensor_exists)
                 {
                     std::ifstream log_file(sensor_id + ".log", std::ios::binary);
+                    if (!log_file.is_open())
+                    {
+                        // Se o arquivo não puder ser aberto, mesmo que o sensor exista no mapa (improvável se o log foi escrito)
+                        std::string error = "ERROR|CANNOT_READ_LOG_FILE\\r\\n";
+                        boost::asio::write(socket_, boost::asio::buffer(error));
+                        return;
+                    }
+
                     log_file.seekg(0, std::ios::end);
                     std::streampos file_size = log_file.tellg();
                     int total_records = file_size / sizeof(LogRecord);
@@ -127,7 +184,30 @@ private:
     {
         std::tm tm = {};
         std::istringstream ss(time_string);
-        ss >> std::get_time(&tm, "%Y-%m-%dT%H:%M:%S");
+        // Adicionar verificação de falha para get_time
+        if (!(ss >> std::get_time(&tm, "%Y-%m-%dT%H:%M:%S")))
+        {
+            // Lançar uma exceção ou retornar um valor indicando erro
+            // Por simplicidade, vamos logar e retornar um time_t inválido (0 ou -1)
+            // Em um cenário real, um tratamento de erro mais robusto seria necessário.
+            std::cerr << "Error parsing time string: " << time_string << std::endl;
+            return static_cast<std::time_t>(-1); // Ou lançar std::runtime_error
+        }
+        // Verificar se a conversão foi completa e não há caracteres restantes inválidos
+        if (ss.fail() || !ss.eof())
+        {
+            // Se houver caracteres restantes ou a conversão falhou de outra forma
+            char c;
+            if (ss.clear(), ss >> c)
+            { // Tenta ler o próximo caractere
+                std::cerr << "Error parsing time string: " << time_string << " - unexpected character: " << c << std::endl;
+            }
+            else
+            {
+                std::cerr << "Error parsing time string: " << time_string << " - format error." << std::endl;
+            }
+            return static_cast<std::time_t>(-1);
+        }
         return std::mktime(&tm);
     }
 
@@ -142,6 +222,7 @@ private:
     tcp::socket socket_;
     boost::asio::streambuf buffer_;
     std::unordered_map<std::string, std::ofstream> &logs_;
+    std::mutex &logs_mutex_; // Adicionado mutex
 };
 
 class Server
@@ -161,7 +242,7 @@ private:
             {
                 if (!ec)
                 {
-                    std::make_shared<Session>(std::move(socket), logs_)->start();
+                    std::make_shared<Session>(std::move(socket), logs_, logs_mutex_)->start(); // Passar o mutex
                 }
                 accept();
             });
@@ -169,6 +250,7 @@ private:
 
     tcp::acceptor acceptor_;
     std::unordered_map<std::string, std::ofstream> logs_;
+    std::mutex logs_mutex_; // Adicionado mutex
 };
 
 int main(int argc, char *argv[])
